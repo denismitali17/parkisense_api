@@ -1,4 +1,6 @@
 import os
+import sys
+import traceback
 import shutil
 import librosa
 import joblib
@@ -8,9 +10,11 @@ import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Parkinson's Acoustic Analysis Production API (Optimized)")
+# Memory optimization guard: Prevent librosa from building massive memory caches
+os.environ["LIBROSA_CACHE_DIR"] = ""
 
-# Enable cross-origin requests for frontend connectivity 
+app = FastAPI(title="Parkinson's Acoustic Analysis Production API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,11 +22,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global model engine variables
 MODEL = None
 SCALER = None
 IQR_BOUNDS = None
-EXPECTED_FEATURES = 16 
+EXPECTED_FEATURES = 16
 
 @app.on_event("startup")
 def load_assets():
@@ -32,18 +35,16 @@ def load_assets():
         SCALER = joblib.load("production_scaler.joblib")
         IQR_BOUNDS = joblib.load("production_iqr_bounds.joblib")
         
-        # Guard check: Ensure the loaded model features match expected inputs
         if hasattr(MODEL, "n_features_in_"):
             EXPECTED_FEATURES = MODEL.n_features_in_
-            
         print(f"[SUCCESS] Production ML components loaded. Expected input features: {EXPECTED_FEATURES}")
     except Exception as e:
         print(f"[FATAL] System failed to initialize model assets: {str(e)}")
 
 def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
     """Extracts identical clinical handcrafted metrics from an isolated 3-second block"""
-    # 1. Fundamental Frequency Tracking
-    f0, _, _ = librosa.pyin(chunk, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr)
+    # 1. Fundamental Frequency Tracking (Optimized search range to minimize memory usage)
+    f0, _, _ = librosa.pyin(chunk, fmin=80, fmax=400, sr=sr)
     f0_clean = f0[~np.isnan(f0)] if f0 is not None else np.array([])
     
     # 2. Extract Classical Micro-Acoustic Metrics
@@ -59,7 +60,10 @@ def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
     mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13)
     mfcc_means = np.mean(mfccs, axis=1)
     
-    return np.array([jitter, shimmer, hnr] + list(mfcc_means))
+    # Handle mathematical Edge Cases (Force any random Inf/NaN conversions down to 0.0)
+    features = np.array([jitter, shimmer, hnr] + list(mfcc_means))
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    return features
 
 @app.get("/")
 def health_check():
@@ -70,66 +74,53 @@ async def predict_parkinsons(file: UploadFile = File(...)):
     if MODEL is None:
         raise HTTPException(status_code=500, detail="Prediction engine is currently offline.")
     
-    # FIX #3: Strict Audio Format Input Validation Gate
     allowed_extensions = ('.wav', '.mp3', '.flac', '.m4a', '.ogg')
     if not file.filename.lower().endswith(allowed_extensions):
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Unsupported file format. Please upload an audio file ending with {allowed_extensions}."
-        )
+        raise HTTPException(status_code=400, detail="Unsupported file format.")
         
-    # FIX #4: Secure OS-Managed Isolated Temporary File Stream
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
         temp_path = tmp_file.name
         shutil.copyfileobj(file.file, tmp_file)
         
     try:
-        # Load audio with original sample rate preserve rules
-        y, sr = librosa.load(temp_path, sr=None)
+        # Downsample target to 16kHz on load to drastically decrease processing memory
+        y, sr = librosa.load(temp_path, sr=16000)
         
-        # Apply Voice Activity Detection (VAD)
-        intervals = librosa.effects.split(y, top_db=20)
+        # Apply Voice Activity Detection (VAD) with softer threshold to protect smooth voices
+        intervals = librosa.effects.split(y, top_db=30)
         v_signal = np.concatenate([y[start:end] for start, end in intervals]) if len(intervals) > 0 else y
         
-        # Define samples inside a single standard 3-second block window
         chunk_samples = int(3.0 * sr)
-        
-        # Pad shorter audio files up to a minimum single chunk length 
         if len(v_signal) < chunk_samples:
             v_signal = np.pad(v_signal, (0, chunk_samples - len(v_signal)), mode='constant')
             
-        # FIX #1 & #5: Segment the entire voice stream into sequential 3-second blocks
         chunks_features = []
-        step_size = chunk_samples # Non-overlapping steps matching basic block splits
+        step_size = chunk_samples
         
         for start_idx in range(0, len(v_signal) - chunk_samples + 1, step_size):
             chunk = v_signal[start_idx : start_idx + chunk_samples]
             feat = extract_single_chunk_features(chunk, sr)
             chunks_features.append(feat)
             
-        # Fallback if window parsing boundaries missed segment extractions
+        # Hard cap evaluation array limit to prevent out-of-memory errors on long files
+        if len(chunks_features) > 25:
+            chunks_features = chunks_features[:25]
+            
         if not chunks_features:
             chunks_features.append(extract_single_chunk_features(v_signal[:chunk_samples], sr))
             
         X_extracted = np.array(chunks_features)
         
-        # FIX #2: Structural Dimension Safety Check
         if X_extracted.shape[1] != EXPECTED_FEATURES:
-            raise ValueError(f"Feature count mismatch. Model expected {EXPECTED_FEATURES}, but extracted {X_extracted.shape[1]}.")
+            raise ValueError(f"Feature count mismatch. Model expected {EXPECTED_FEATURES}, got {X_extracted.shape[1]}.")
             
-        # Apply training-equivalent clipping and scale matrices across all chunks
         lo, hi = IQR_BOUNDS
         X_clipped = np.clip(X_extracted, lo, hi)
         X_scaled = SCALER.transform(X_clipped)
         
-        # Perform predictive inference over all individual windows
-        chunk_predictions = MODEL.predict(X_scaled)       # Vector of 0s and 1s per chunk
-        chunk_probabilities = MODEL.predict_proba(X_scaled) # Probabilities [[P(0), P(1)], ...] per chunk
+        chunk_probabilities = MODEL.predict_proba(X_scaled)
+        mean_prob_pd = np.mean(chunk_probabilities[:, 1])
         
-        # Calculate ensemble averages across the audio timeline
-        mean_prob_pd = np.mean(chunk_probabilities[:, 1])  # Average probability for Parkinson's Disease
-        
-        # Determine overall patient status based on average confidence
         final_prediction = 1 if mean_prob_pd >= 0.5 else 0
         final_confidence = mean_prob_pd if final_prediction == 1 else (1.0 - mean_prob_pd)
         
@@ -141,9 +132,12 @@ async def predict_parkinsons(file: UploadFile = File(...)):
         }
         
     except Exception as e:
+        # Explicitly print the true failure path details right into the Render log terminal stream
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        print("[CRITICAL RUNTIME ERROR TRACEBACK]:")
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stdout)
         raise HTTPException(status_code=500, detail=f"Inference failure: {str(e)}")
         
     finally:
-        # Securely sweep tracking cleanup path locations
         if os.path.exists(temp_path):
             os.remove(temp_path)
