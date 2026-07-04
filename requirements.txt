@@ -6,3 +6,4 @@ numpy==1.26.4
 scikit-learn==1.4.2
 joblib==1.4.2
 soundfile==0.12.1
+pandas==2.2.2
