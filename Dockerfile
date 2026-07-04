@@ -1,19 +1,22 @@
-# Use an official, lightweight Python runtime base image
-FROM python:3.10-slim
+# Force a rock-solid Python 3.10 stable debian environment
+FROM python:3.10-slim-bullseye
 
 # Install system audio dependencies required by librosa and soundfile
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
-    && rm -rf /lib/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
-# Establish the working directory inside the container image
+# Establish our working directory inside the container image
 WORKDIR /app
 
 # Copy dependency files first to utilize Docker's build caching mechanisms
 COPY requirements.txt .
 
-# Install Python application dependencies
+# Upgrade pip, setuptools, and wheel to safely unpack old binary structures
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install Python application dependencies safely from pre-built wheels
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy all model files and Python source scripts into the working engine container
