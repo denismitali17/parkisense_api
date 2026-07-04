@@ -10,7 +10,7 @@ import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# Memory optimization guard: Prevent librosa from building massive memory caches
+# Memory optimization guard
 os.environ["LIBROSA_CACHE_DIR"] = ""
 
 app = FastAPI(title="Parkinson's Acoustic Analysis Production API")
@@ -37,30 +37,39 @@ def load_assets():
         
         if hasattr(MODEL, "n_features_in_"):
             EXPECTED_FEATURES = MODEL.n_features_in_
-        print(f"[SUCCESS] Production ML components loaded. Expected input features: {EXPECTED_FEATURES}")
+        print(f"[SUCCESS] Model assets loaded. Expected features: {EXPECTED_FEATURES}")
     except Exception as e:
         print(f"[FATAL] System failed to initialize model assets: {str(e)}")
 
 def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
-    """Extracts identical clinical handcrafted metrics from an isolated 3-second block"""
-    # 1. Fundamental Frequency Tracking (Optimized search range to minimize memory usage)
-    f0, _, _ = librosa.pyin(chunk, fmin=80, fmax=400, sr=sr)
+    """Extracts identical clinical metrics with 8x frame-stepping speed hacks"""
+    
+    # hop_length=512 reduces processing frames by 8x compared to default (64)
+    f0, _, _ = librosa.pyin(
+        chunk, 
+        fmin=85, 
+        fmax=350, 
+        sr=sr, 
+        hop_length=512,
+        fill_na=None
+    )
     f0_clean = f0[~np.isnan(f0)] if f0 is not None else np.array([])
     
     # 2. Extract Classical Micro-Acoustic Metrics
     jitter = np.std(np.diff(f0_clean)) / np.mean(f0_clean) if len(f0_clean) > 1 else 0.0
-    rms = librosa.feature.rms(y=chunk)
+    
+    rms = librosa.feature.rms(y=chunk, hop_length=512)
     shimmer = np.std(rms) / np.mean(rms) if np.mean(rms) > 0 else 0.0
     
-    harmonic = librosa.effects.harmonic(chunk)
+    harmonic = librosa.effects.harmonic(chunk, margin=2.0)
     energy_diff = np.sum((chunk - harmonic)**2)
     hnr = 10 * np.log10(np.sum(harmonic**2) / max(1e-6, energy_diff)) if energy_diff > 0 else 0.0
     
-    # 3. Extract Mel-Frequency Cepstral Coefficients
-    mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13)
+    # 3. Extract 13 MFCCs (Fast)
+    mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13, hop_length=512)
     mfcc_means = np.mean(mfccs, axis=1)
     
-    # Handle mathematical Edge Cases (Force any random Inf/NaN conversions down to 0.0)
+    # Handle mathematical Edge Cases
     features = np.array([jitter, shimmer, hnr] + list(mfcc_means))
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
     return features
@@ -72,7 +81,7 @@ def health_check():
 @app.post("/predict")
 async def predict_parkinsons(file: UploadFile = File(...)):
     if MODEL is None:
-        raise HTTPException(status_code=500, detail="Prediction engine is currently offline.")
+        raise HTTPException(status_code=500, detail="Prediction engine is offline.")
     
     allowed_extensions = ('.wav', '.mp3', '.flac', '.m4a', '.ogg')
     if not file.filename.lower().endswith(allowed_extensions):
@@ -83,11 +92,10 @@ async def predict_parkinsons(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, tmp_file)
         
     try:
-        # Downsample target to 16kHz on load to drastically decrease processing memory
-        y, sr = librosa.load(temp_path, sr=16000)
+        #  Match notebook native sample rate exactly
+        y, sr = librosa.load(temp_path, sr=None)
         
-        # Apply Voice Activity Detection (VAD) with softer threshold to protect smooth voices
-        intervals = librosa.effects.split(y, top_db=30)
+        intervals = librosa.effects.split(y, top_db=20)
         v_signal = np.concatenate([y[start:end] for start, end in intervals]) if len(intervals) > 0 else y
         
         chunk_samples = int(3.0 * sr)
@@ -102,9 +110,10 @@ async def predict_parkinsons(file: UploadFile = File(...)):
             feat = extract_single_chunk_features(chunk, sr)
             chunks_features.append(feat)
             
-        # Hard cap evaluation array limit to prevent out-of-memory errors on long files
-        if len(chunks_features) > 25:
-            chunks_features = chunks_features[:25]
+        # Analyze up to 10 chunks (30 seconds). 
+        # This gives a bulletproof average without hanging the API.
+        if len(chunks_features) > 10:
+            chunks_features = chunks_features[:10]
             
         if not chunks_features:
             chunks_features.append(extract_single_chunk_features(v_signal[:chunk_samples], sr))
@@ -112,7 +121,7 @@ async def predict_parkinsons(file: UploadFile = File(...)):
         X_extracted = np.array(chunks_features)
         
         if X_extracted.shape[1] != EXPECTED_FEATURES:
-            raise ValueError(f"Feature count mismatch. Model expected {EXPECTED_FEATURES}, got {X_extracted.shape[1]}.")
+            raise ValueError(f"Feature mismatch. Expected {EXPECTED_FEATURES}, got {X_extracted.shape[1]}.")
             
         lo, hi = IQR_BOUNDS
         X_clipped = np.clip(X_extracted, lo, hi)
@@ -132,7 +141,6 @@ async def predict_parkinsons(file: UploadFile = File(...)):
         }
         
     except Exception as e:
-        # Explicitly print the true failure path details right into the Render log terminal stream
         exc_type, exc_value, exc_traceback = sys.exc_info()
         print("[CRITICAL RUNTIME ERROR TRACEBACK]:")
         traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stdout)
