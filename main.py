@@ -1,14 +1,14 @@
 import os
 import sys
+import io
 import traceback
-import shutil
 import librosa
 import joblib
-import tempfile
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydub import AudioSegment
 
 # Memory optimization guard
 os.environ["LIBROSA_CACHE_DIR"] = ""
@@ -55,7 +55,7 @@ def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
     )
     f0_clean = f0[~np.isnan(f0)] if f0 is not None else np.array([])
     
-    # 2. Extract Classical Micro-Acoustic Metrics
+    # Extract Classical Micro-Acoustic Metrics
     jitter = np.std(np.diff(f0_clean)) / np.mean(f0_clean) if len(f0_clean) > 1 else 0.0
     
     rms = librosa.feature.rms(y=chunk, hop_length=512)
@@ -65,7 +65,7 @@ def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
     energy_diff = np.sum((chunk - harmonic)**2)
     hnr = 10 * np.log10(np.sum(harmonic**2) / max(1e-6, energy_diff)) if energy_diff > 0 else 0.0
     
-    # 3. Extract 13 MFCCs (Fast)
+    # Extract 13 MFCCs (Fast)
     mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13, hop_length=512)
     mfcc_means = np.mean(mfccs, axis=1)
     
@@ -83,18 +83,35 @@ async def predict_parkinsons(file: UploadFile = File(...)):
     if MODEL is None:
         raise HTTPException(status_code=500, detail="Prediction engine is offline.")
     
-    allowed_extensions = ('.wav', '.mp3', '.flac', '.m4a', '.ogg')
+    allowed_extensions = ('.wav', '.mp3', '.flac', '.m4a', '.ogg', '.webm', '.caf')
     if not file.filename.lower().endswith(allowed_extensions):
         raise HTTPException(status_code=400, detail="Unsupported file format.")
         
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-        temp_path = tmp_file.name
-        shutil.copyfileobj(file.file, tmp_file)
-        
     try:
-        #  Match notebook native sample rate exactly
-        y, sr = librosa.load(temp_path, sr=None)
+        # Read raw uploaded file stream directly out of incoming RAM buffer
+        file_bytes = await file.read()
         
+        # Decode the memory block via pydub audio segment layout container
+        try:
+            audio_segment = AudioSegment.from_file(io.BytesIO(file_bytes))
+        except Exception as container_err:
+            # Fallback if the browser streams unformatted raw block chunks
+            audio_segment = AudioSegment.from_raw(
+                io.BytesIO(file_bytes), 
+                sample_width=2, 
+                frame_rate=44100, 
+                channels=1
+            )
+            
+        # Enforce target sampling rate requirements (16kHz standard for clean acoustic capture)
+        sr = 16000
+        audio_segment = audio_segment.set_frame_rate(sr).set_channels(1)
+        
+        # Extract underlying PCM data bytes directly to a normalized floating-point matrix array
+        raw_samples = audio_segment.get_array_of_samples()
+        y = np.array(raw_samples).astype(np.float32) / 32768.0
+        
+        # Execute silent interval truncation pipeline
         intervals = librosa.effects.split(y, top_db=20)
         v_signal = np.concatenate([y[start:end] for start, end in intervals]) if len(intervals) > 0 else y
         
@@ -110,8 +127,7 @@ async def predict_parkinsons(file: UploadFile = File(...)):
             feat = extract_single_chunk_features(chunk, sr)
             chunks_features.append(feat)
             
-        # Analyze up to 10 chunks (30 seconds). 
-        # This gives a bulletproof average without hanging the API.
+        # Analyze up to 10 chunks (30 seconds) to prevent API thread starvation
         if len(chunks_features) > 10:
             chunks_features = chunks_features[:10]
             
@@ -145,7 +161,3 @@ async def predict_parkinsons(file: UploadFile = File(...)):
         print("[CRITICAL RUNTIME ERROR TRACEBACK]:")
         traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stdout)
         raise HTTPException(status_code=500, detail=f"Inference failure: {str(e)}")
-        
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
