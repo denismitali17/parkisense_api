@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from scipy.io import wavfile
 
 # Memory optimization guard
 os.environ["LIBROSA_CACHE_DIR"] = ""
@@ -78,15 +79,14 @@ async def predict_parkinsons(file: UploadFile = File(...)):
     if MODEL is None:
         raise HTTPException(status_code=500, detail="Prediction engine is offline.")
     
-    allowed_extensions = ('.wav', '.mp3', '.flac', '.m4a', '.ogg', '.webm', '.caf')
-    if not file.filename.lower().endswith(allowed_extensions):
-        raise HTTPException(status_code=400, detail="Unsupported file format.")
-        
     try:
         # Read raw uploaded file stream into memory
         file_bytes = await file.read()
         
-        # Try native python wav parsing first (Fastest, zero system dependencies)
+        y = None
+        sr = 16000
+        
+        # Standard RIFF WAV Parser
         try:
             with wave.open(io.BytesIO(file_bytes), 'rb') as wav_in:
                 n_channels = wav_in.getnchannels()
@@ -95,31 +95,41 @@ async def predict_parkinsons(file: UploadFile = File(...)):
                 n_frames = wav_in.getnframes()
                 
                 raw_data = wav_in.readframes(n_frames)
+                dtype = np.int16 if sampwidth == 2 else (np.int32 if sampwidth == 4 else np.uint8)
+                denom = 32768.0 if sampwidth == 2 else (2147483648.0 if sampwidth == 4 else 255.0)
                 
-                if sampwidth == 2:
-                    dtype = np.int16
-                    denom = 32768.0
-                elif sampwidth == 4:
-                    dtype = np.int32
-                    denom = 2147483648.0
-                else:
-                    dtype = np.uint8
-                    denom = 255.0
-                    
                 y = np.frombuffer(raw_data, dtype=dtype).astype(np.float32) / denom
-                # Handle multi-channel conversions natively if stereo
                 if n_channels > 1:
                     y = y.reshape(-1, n_channels).mean(axis=1)
         except Exception:
-            # Fallback to general scientific stream loading if headers vary
-            y, sr = librosa.load(io.BytesIO(file_bytes), sr=16000)
+            # Scipy memory stream backup bypass
+            try:
+                sr, data = wavfile.read(io.BytesIO(file_bytes))
+                if data.dtype == np.int16:
+                    y = data.astype(np.float32) / 32768.0
+                elif data.dtype == np.int32:
+                    y = data.astype(np.float32) / 2147483648.0
+                elif data.dtype == np.float32:
+                    y = data
+                else:
+                    y = data.astype(np.float32) / 255.0
+                if len(y.shape) > 1:
+                    y = y.mean(axis=1)
+            except Exception:
+                # Pure Raw Binary Array Processing Fallback 
 
-        # Target inference sample rate sync check
-        if 'sr' not in locals() or sr != 16000:
-            sr = 16000
+                y = np.frombuffer(file_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                if len(y) == 0:
+                    y = np.frombuffer(file_bytes, dtype=np.float32)
+                if len(y) == 0:
+                    raise ValueError("Audio structure initialization generated an empty payload array.")
+        
+        #. Resample target frequency if required
+        if sr != 16000 and len(y) > 0:
             y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+            sr = 16000
 
-        # Execute analysis window segmentation
+        #. Execute analysis window segmentation
         intervals = librosa.effects.split(y, top_db=20)
         v_signal = np.concatenate([y[start:end] for start, end in intervals]) if len(intervals) > 0 else y
         
