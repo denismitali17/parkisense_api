@@ -2,13 +2,13 @@ import os
 import sys
 import io
 import traceback
+import wave
 import librosa
 import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydub import AudioSegment
 
 # Memory optimization guard
 os.environ["LIBROSA_CACHE_DIR"] = ""
@@ -43,8 +43,6 @@ def load_assets():
 
 def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
     """Extracts identical clinical metrics with 8x frame-stepping speed hacks"""
-    
-    # hop_length=512 reduces processing frames by 8x compared to default (64)
     f0, _, _ = librosa.pyin(
         chunk, 
         fmin=85, 
@@ -55,7 +53,6 @@ def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
     )
     f0_clean = f0[~np.isnan(f0)] if f0 is not None else np.array([])
     
-    # Extract Classical Micro-Acoustic Metrics
     jitter = np.std(np.diff(f0_clean)) / np.mean(f0_clean) if len(f0_clean) > 1 else 0.0
     
     rms = librosa.feature.rms(y=chunk, hop_length=512)
@@ -65,11 +62,9 @@ def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
     energy_diff = np.sum((chunk - harmonic)**2)
     hnr = 10 * np.log10(np.sum(harmonic**2) / max(1e-6, energy_diff)) if energy_diff > 0 else 0.0
     
-    # Extract 13 MFCCs (Fast)
     mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13, hop_length=512)
     mfcc_means = np.mean(mfccs, axis=1)
     
-    # Handle mathematical Edge Cases
     features = np.array([jitter, shimmer, hnr] + list(mfcc_means))
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
     return features
@@ -88,30 +83,43 @@ async def predict_parkinsons(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Unsupported file format.")
         
     try:
-        # Read raw uploaded file stream directly out of incoming RAM buffer
+        # Read raw uploaded file stream into memory
         file_bytes = await file.read()
         
-        # Decode the memory block via pydub audio segment layout container
+        # Try native python wav parsing first (Fastest, zero system dependencies)
         try:
-            audio_segment = AudioSegment.from_file(io.BytesIO(file_bytes))
-        except Exception as container_err:
-            # Fallback if the browser streams unformatted raw block chunks
-            audio_segment = AudioSegment.from_raw(
-                io.BytesIO(file_bytes), 
-                sample_width=2, 
-                frame_rate=44100, 
-                channels=1
-            )
-            
-        # Enforce target sampling rate requirements (16kHz standard for clean acoustic capture)
-        sr = 16000
-        audio_segment = audio_segment.set_frame_rate(sr).set_channels(1)
-        
-        # Extract underlying PCM data bytes directly to a normalized floating-point matrix array
-        raw_samples = audio_segment.get_array_of_samples()
-        y = np.array(raw_samples).astype(np.float32) / 32768.0
-        
-        # Execute silent interval truncation pipeline
+            with wave.open(io.BytesIO(file_bytes), 'rb') as wav_in:
+                n_channels = wav_in.getnchannels()
+                sampwidth = wav_in.getsampwidth()
+                sr = wav_in.getframerate()
+                n_frames = wav_in.getnframes()
+                
+                raw_data = wav_in.readframes(n_frames)
+                
+                if sampwidth == 2:
+                    dtype = np.int16
+                    denom = 32768.0
+                elif sampwidth == 4:
+                    dtype = np.int32
+                    denom = 2147483648.0
+                else:
+                    dtype = np.uint8
+                    denom = 255.0
+                    
+                y = np.frombuffer(raw_data, dtype=dtype).astype(np.float32) / denom
+                # Handle multi-channel conversions natively if stereo
+                if n_channels > 1:
+                    y = y.reshape(-1, n_channels).mean(axis=1)
+        except Exception:
+            # Fallback to general scientific stream loading if headers vary
+            y, sr = librosa.load(io.BytesIO(file_bytes), sr=16000)
+
+        # Target inference sample rate sync check
+        if 'sr' not in locals() or sr != 16000:
+            sr = 16000
+            y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+
+        # Execute analysis window segmentation
         intervals = librosa.effects.split(y, top_db=20)
         v_signal = np.concatenate([y[start:end] for start, end in intervals]) if len(intervals) > 0 else y
         
@@ -127,7 +135,6 @@ async def predict_parkinsons(file: UploadFile = File(...)):
             feat = extract_single_chunk_features(chunk, sr)
             chunks_features.append(feat)
             
-        # Analyze up to 10 chunks (30 seconds) to prevent API thread starvation
         if len(chunks_features) > 10:
             chunks_features = chunks_features[:10]
             
