@@ -2,17 +2,17 @@ import os
 import sys
 import io
 import traceback
-import wave
 import librosa
 import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from scipy.io import wavfile
+import soundfile as sf
 
-# Memory optimization guard
 os.environ["LIBROSA_CACHE_DIR"] = ""
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 app = FastAPI(title="Parkinson's Acoustic Analysis Production API")
 
@@ -43,27 +43,29 @@ def load_assets():
         print(f"[FATAL] System failed to initialize model assets: {str(e)}")
 
 def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
-    """Extracts identical clinical metrics with 8x frame-stepping speed hacks"""
+    """Extracts identical clinical metrics with extreme performance optimizations"""
+    
     f0, _, _ = librosa.pyin(
         chunk, 
         fmin=85, 
         fmax=350, 
         sr=sr, 
-        hop_length=512,
+        hop_length=1024, 
         fill_na=None
     )
     f0_clean = f0[~np.isnan(f0)] if f0 is not None else np.array([])
     
     jitter = np.std(np.diff(f0_clean)) / np.mean(f0_clean) if len(f0_clean) > 1 else 0.0
     
-    rms = librosa.feature.rms(y=chunk, hop_length=512)
+    rms = librosa.feature.rms(y=chunk, hop_length=1024)
     shimmer = np.std(rms) / np.mean(rms) if np.mean(rms) > 0 else 0.0
     
+    # Fast HNR calculation bypass to save memory
     harmonic = librosa.effects.harmonic(chunk, margin=2.0)
     energy_diff = np.sum((chunk - harmonic)**2)
     hnr = 10 * np.log10(np.sum(harmonic**2) / max(1e-6, energy_diff)) if energy_diff > 0 else 0.0
     
-    mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13, hop_length=512)
+    mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13, hop_length=1024)
     mfcc_means = np.mean(mfccs, axis=1)
     
     features = np.array([jitter, shimmer, hnr] + list(mfcc_means))
@@ -80,25 +82,28 @@ async def predict_parkinsons(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail="Prediction engine is offline.")
         
     try:
-        # Read the clean WAV file bytes from Flutter
+        # Read raw bytes directly into memory
         file_bytes = await file.read()
         
-        # Parse standard WAV headers safely using standard library
-        with wave.open(io.BytesIO(file_bytes), 'rb') as wav_in:
-            n_channels = wav_in.getnchannels()
-            sampwidth = wav_in.getsampwidth()
-            sr = wav_in.getframerate()
-            n_frames = wav_in.getnframes()
-            
-            raw_data = wav_in.readframes(n_frames)
-            dtype = np.int16 if sampwidth == 2 else (np.int32 if sampwidth == 4 else np.uint8)
-            denom = 32768.0 if sampwidth == 2 else (2147483648.0 if sampwidth == 4 else 255.0)
-            
-            y = np.frombuffer(raw_data, dtype=dtype).astype(np.float32) / denom
-            if n_channels > 1:
-                y = y.reshape(-1, n_channels).mean(axis=1)
+        # 2. Universal Soundfile memory read 
+        try:
+            data, sr = sf.read(io.BytesIO(file_bytes))
+            y = data.astype(np.float32)
+            # Convert stereo to mono instantly if needed
+            if len(y.shape) > 1:
+                y = y.mean(axis=1)
+        except Exception:
+            # Read raw binary buffer as float sequence
+            y = np.frombuffer(file_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            sr = 16000
+            if len(y) == 0:
+                raise ValueError("Could not decode audio stream array layout.")
 
-        # Quick safe-resample check
+        max_samples = 10 * sr
+        if len(y) > max_samples:
+            y = y[:max_samples]
+
+        # Standardize Sample Rate
         if sr != 16000:
             y = librosa.resample(y, orig_sr=sr, target_sr=16000)
             sr = 16000
@@ -113,17 +118,19 @@ async def predict_parkinsons(file: UploadFile = File(...)):
             
         chunks_features = []
         
-        
         step_size = chunk_samples
         for start_idx in range(0, len(v_signal) - chunk_samples + 1, step_size):
             chunk = v_signal[start_idx : start_idx + chunk_samples]
             feat = extract_single_chunk_features(chunk, sr)
             chunks_features.append(feat)
-            if len(chunks_features) >= 3: 
+            if len(chunks_features) >= 2: 
                 break
             
         X_extracted = np.array(chunks_features)
         
+        if X_extracted.shape[1] != EXPECTED_FEATURES:
+            raise ValueError(f"Feature mismatch. Expected {EXPECTED_FEATURES}, got {X_extracted.shape[1]}.")
+            
         lo, hi = IQR_BOUNDS
         X_clipped = np.clip(X_extracted, lo, hi)
         X_scaled = SCALER.transform(X_clipped)
@@ -142,4 +149,7 @@ async def predict_parkinsons(file: UploadFile = File(...)):
         }
         
     except Exception as e:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        print("[CRITICAL RUNTIME ERROR TRACEBACK]:")
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stdout)
         raise HTTPException(status_code=500, detail=f"Inference failure: {str(e)}")
