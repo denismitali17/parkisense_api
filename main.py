@@ -78,58 +78,32 @@ def health_check():
 async def predict_parkinsons(file: UploadFile = File(...)):
     if MODEL is None:
         raise HTTPException(status_code=500, detail="Prediction engine is offline.")
-    
+        
     try:
-        # Read raw uploaded file stream into memory
+        # Read the clean WAV file bytes from Flutter
         file_bytes = await file.read()
         
-        y = None
-        sr = 16000
-        
-        # Standard RIFF WAV Parser
-        try:
-            with wave.open(io.BytesIO(file_bytes), 'rb') as wav_in:
-                n_channels = wav_in.getnchannels()
-                sampwidth = wav_in.getsampwidth()
-                sr = wav_in.getframerate()
-                n_frames = wav_in.getnframes()
-                
-                raw_data = wav_in.readframes(n_frames)
-                dtype = np.int16 if sampwidth == 2 else (np.int32 if sampwidth == 4 else np.uint8)
-                denom = 32768.0 if sampwidth == 2 else (2147483648.0 if sampwidth == 4 else 255.0)
-                
-                y = np.frombuffer(raw_data, dtype=dtype).astype(np.float32) / denom
-                if n_channels > 1:
-                    y = y.reshape(-1, n_channels).mean(axis=1)
-        except Exception:
-            # Scipy memory stream backup bypass
-            try:
-                sr, data = wavfile.read(io.BytesIO(file_bytes))
-                if data.dtype == np.int16:
-                    y = data.astype(np.float32) / 32768.0
-                elif data.dtype == np.int32:
-                    y = data.astype(np.float32) / 2147483648.0
-                elif data.dtype == np.float32:
-                    y = data
-                else:
-                    y = data.astype(np.float32) / 255.0
-                if len(y.shape) > 1:
-                    y = y.mean(axis=1)
-            except Exception:
-                # Pure Raw Binary Array Processing Fallback 
+        # Parse standard WAV headers safely using standard library
+        with wave.open(io.BytesIO(file_bytes), 'rb') as wav_in:
+            n_channels = wav_in.getnchannels()
+            sampwidth = wav_in.getsampwidth()
+            sr = wav_in.getframerate()
+            n_frames = wav_in.getnframes()
+            
+            raw_data = wav_in.readframes(n_frames)
+            dtype = np.int16 if sampwidth == 2 else (np.int32 if sampwidth == 4 else np.uint8)
+            denom = 32768.0 if sampwidth == 2 else (2147483648.0 if sampwidth == 4 else 255.0)
+            
+            y = np.frombuffer(raw_data, dtype=dtype).astype(np.float32) / denom
+            if n_channels > 1:
+                y = y.reshape(-1, n_channels).mean(axis=1)
 
-                y = np.frombuffer(file_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                if len(y) == 0:
-                    y = np.frombuffer(file_bytes, dtype=np.float32)
-                if len(y) == 0:
-                    raise ValueError("Audio structure initialization generated an empty payload array.")
-        
-        #. Resample target frequency if required
-        if sr != 16000 and len(y) > 0:
+        # Quick safe-resample check
+        if sr != 16000:
             y = librosa.resample(y, orig_sr=sr, target_sr=16000)
             sr = 16000
 
-        #. Execute analysis window segmentation
+        # Silence Truncation
         intervals = librosa.effects.split(y, top_db=20)
         v_signal = np.concatenate([y[start:end] for start, end in intervals]) if len(intervals) > 0 else y
         
@@ -138,24 +112,18 @@ async def predict_parkinsons(file: UploadFile = File(...)):
             v_signal = np.pad(v_signal, (0, chunk_samples - len(v_signal)), mode='constant')
             
         chunks_features = []
-        step_size = chunk_samples
         
+        
+        step_size = chunk_samples
         for start_idx in range(0, len(v_signal) - chunk_samples + 1, step_size):
             chunk = v_signal[start_idx : start_idx + chunk_samples]
             feat = extract_single_chunk_features(chunk, sr)
             chunks_features.append(feat)
-            
-        if len(chunks_features) > 10:
-            chunks_features = chunks_features[:10]
-            
-        if not chunks_features:
-            chunks_features.append(extract_single_chunk_features(v_signal[:chunk_samples], sr))
+            if len(chunks_features) >= 3: 
+                break
             
         X_extracted = np.array(chunks_features)
         
-        if X_extracted.shape[1] != EXPECTED_FEATURES:
-            raise ValueError(f"Feature mismatch. Expected {EXPECTED_FEATURES}, got {X_extracted.shape[1]}.")
-            
         lo, hi = IQR_BOUNDS
         X_clipped = np.clip(X_extracted, lo, hi)
         X_scaled = SCALER.transform(X_clipped)
@@ -174,7 +142,4 @@ async def predict_parkinsons(file: UploadFile = File(...)):
         }
         
     except Exception as e:
-        exc_type, exc_value, exc_traceback = sys.exc_info()
-        print("[CRITICAL RUNTIME ERROR TRACEBACK]:")
-        traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stdout)
         raise HTTPException(status_code=500, detail=f"Inference failure: {str(e)}")
