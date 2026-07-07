@@ -44,28 +44,36 @@ def load_assets():
         print(f"[FATAL] System failed to initialize machine learning assets: {str(e)}")
 
 def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
-    """Extracts identical clinical metrics with extreme performance optimizations for Render"""
+    """Extracts identical clinical metrics with optimized frame-stepping configurations"""
     
-    f0, _, _ = librosa.pyin(
-        chunk, 
-        fmin=85, 
-        fmax=350, 
-        sr=sr, 
-        hop_length=1024, 
-        fill_na=None
-    )
-    f0_clean = f0[~np.isnan(f0)] if f0 is not None else np.array([])
+
+    try:
+        f0, _, _ = librosa.pyin(
+            chunk, 
+            fmin=85, 
+            fmax=350, 
+            sr=sr, 
+            hop_length=512, 
+            fill_na=None
+        )
+        f0_clean = f0[~np.isnan(f0)] if f0 is not None else np.array([])
+    except Exception:
+
+        f0_clean = np.array([])
     
     # Classical Micro-Acoustic Metrics (Jitter & Shimmer)
-    jitter = np.std(np.diff(f0_clean)) / np.mean(f0_clean) if len(f0_clean) > 1 else 0.0
+    jitter = np.std(np.diff(f0_clean)) / np.mean(f0_clean) if (len(f0_clean) > 1 and np.mean(f0_clean) > 0) else 0.0
     
     rms = librosa.feature.rms(y=chunk, hop_length=1024)
     shimmer = np.std(rms) / np.mean(rms) if np.mean(rms) > 0 else 0.0
     
-    # Harmonic-to-Noise Ratio (HNR) Bypass Logic
-    harmonic = librosa.effects.harmonic(chunk, margin=2.0)
-    energy_diff = np.sum((chunk - harmonic)**2)
-    hnr = 10 * np.log10(np.sum(harmonic**2) / max(1e-6, energy_diff)) if energy_diff > 0 else 0.0
+    # Harmonic-to-Noise Ratio (HNR) Logic
+    try:
+        harmonic = librosa.effects.harmonic(chunk, margin=2.0)
+        energy_diff = np.sum((chunk - harmonic)**2)
+        hnr = 10 * np.log10(np.sum(harmonic**2) / max(1e-6, energy_diff)) if energy_diff > 0 else 0.0
+    except Exception:
+        hnr = 0.0
     
     # Extract 13 Mel-Frequency Cepstral Coefficients (MFCCs)
     mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13, hop_length=1024)
@@ -147,9 +155,14 @@ async def predict_parkinsons(file: UploadFile = File(...)):
             
             if len(chunk) < chunk_samples:
                 continue
+            
+            # Safe operational handoff wrapper to ensure feature errors are caught locally
+            try:
+                feat = extract_single_chunk_features(chunk, sr)
+                chunks_features.append(feat)
+            except Exception:
+                continue
                 
-            feat = extract_single_chunk_features(chunk, sr)
-            chunks_features.append(feat)
             if len(chunks_features) >= 2: 
                 break
 
