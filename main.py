@@ -109,16 +109,22 @@ async def predict_parkinsons(file: UploadFile = File(...)):
         if len(y) > max_samples:
             y = y[:max_samples]
 
-        # Standardize Sampling Rate Safely BEFORE applying split filters
         if sr != 16000:
-            y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+            try:
+                if len(y) > 512:
+                    y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+                else:
+                    xp = np.arange(len(y))
+                    x_new = np.linspace(0, len(y) - 1, int(len(y) * 16000 / sr))
+                    y = np.interp(x_new, xp, y).astype(np.float32)
+            except Exception:
+                pass
             sr = 16000
 
         chunk_samples = int(3.0 * sr)
 
         # Safe Silence Truncation Pipeline
         try:
-
             intervals = librosa.effects.split(y, top_db=25) 
             if len(intervals) > 0:
                 v_signal = np.concatenate([y[start:end] for start, end in intervals])
