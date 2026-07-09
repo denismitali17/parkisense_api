@@ -1,0 +1,1 @@
+{"duration": 0.01479482650756836, "input_args": {"sr": "16000", "n_fft": "2048", "n_mels": "128", "fmin": "0.0", "fmax": "None", "htk": "False", "norm": "'slaney'", "dtype": "<class 'numpy.float32'>"}, "time": 1783556880.3155105}
