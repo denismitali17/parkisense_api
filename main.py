@@ -9,6 +9,10 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import soundfile as sf
+import parselmouth
+from parselmouth.praat import call
+import tensorflow as tf
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 os.environ["LIBROSA_CACHE_DIR"] = ""
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -26,6 +30,8 @@ app.add_middleware(
 MODEL = None
 SCALER = None
 IQR_BOUNDS = None
+DEEP_MODEL = None
+MODEL_TYPE = "classical"  # "classical" or "deep"
 EXPECTED_FEATURES = 16
 POSITIVE_CLASS_LABEL = int(os.getenv("PARKINSONS_POSITIVE_CLASS", "1"))
 PREDICTION_THRESHOLD = float(os.getenv("PARKINSONS_THRESHOLD", "0.5"))
@@ -33,60 +39,82 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "production_parkinsons_model.joblib"
 SCALER_PATH = BASE_DIR / "production_scaler.joblib"
 IQR_BOUNDS_PATH = BASE_DIR / "production_iqr_bounds.joblib"
+DEEP_MODEL_PATH = BASE_DIR / "ml_track" / "output" / "production_deep_learning_model.keras"
 
 @app.on_event("startup")
 def load_assets():  
     """Initializes and loads pre-trained machine learning artifacts upon server startup"""
-    global MODEL, SCALER, IQR_BOUNDS, EXPECTED_FEATURES
+    global MODEL, SCALER, IQR_BOUNDS, EXPECTED_FEATURES, DEEP_MODEL, MODEL_TYPE
     try:
-        MODEL = joblib.load(MODEL_PATH)
-        SCALER = joblib.load(SCALER_PATH)
-        IQR_BOUNDS = joblib.load(IQR_BOUNDS_PATH)
+        # Try loading deep learning model first
+        if DEEP_MODEL_PATH.exists():
+            DEEP_MODEL = tf.keras.models.load_model(DEEP_MODEL_PATH, compile=False)
+            MODEL_TYPE = "deep"
+            print(f"[SUCCESS] Deep learning model loaded from {DEEP_MODEL_PATH}")
+        else:
+            # Fall back to classical model
+            MODEL = joblib.load(MODEL_PATH)
+            SCALER = joblib.load(SCALER_PATH)
+            IQR_BOUNDS = joblib.load(IQR_BOUNDS_PATH)
 
-        if hasattr(MODEL, "n_features_in_"):
-            EXPECTED_FEATURES = MODEL.n_features_in_
-        print(f"[SUCCESS] Model assets loaded successfully. Expected features: {EXPECTED_FEATURES}")
+            if hasattr(MODEL, "n_features_in_"):
+                EXPECTED_FEATURES = MODEL.n_features_in_
+            MODEL_TYPE = "classical"
+            print(f"[SUCCESS] Classical model assets loaded successfully. Expected features: {EXPECTED_FEATURES}")
     except Exception as e:
         print(f"[FATAL] System failed to initialize machine learning assets: {str(e)}")
 
+def extract_log_mel_tensor(chunk: np.ndarray, sr: int, n_mels: int = 128, target_shape: tuple = (128, 128)) -> np.ndarray:
+    """Maps continuous time-domain signals to 2D structural logarithmic frequency scale representations (matching notebook)"""
+    peak = np.max(np.abs(chunk)) if len(chunk) > 0 else 0.0
+    if peak > 0.0:
+        chunk = chunk / peak
+
+    hop_len = int((len(chunk) - 1) / (target_shape[1] - 1)) if len(chunk) > target_shape[1] else 512
+    stft_matrix = librosa.feature.melspectrogram(y=chunk, sr=sr, n_mels=n_mels, n_fft=2048, hop_length=hop_len)
+    log_spec = librosa.power_to_db(stft_matrix, ref=np.max)
+
+    if log_spec.shape[1] < target_shape[1]:
+        pad_width = target_shape[1] - log_spec.shape[1]
+        log_spec = np.pad(log_spec, ((0, 0), (0, pad_width)), mode='constant', constant_values=-80.0)
+    else:
+        log_spec = log_spec[:, :target_shape[1]]
+
+    return log_spec[..., np.newaxis]
+
 def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
-    """Extracts identical clinical metrics with optimized frame-stepping configurations"""
-    
-
+    """Extracts exact clinical metrics using parselmouth (Praat) to match training pipeline"""
     try:
-        f0, _, _ = librosa.pyin(
-            chunk, 
-            fmin=85, 
-            fmax=350, 
-            sr=sr, 
-            hop_length=512, 
-            fill_na=None
-        )
-        f0_clean = f0[~np.isnan(f0)] if f0 is not None else np.array([])
-    except Exception:
+        sound = parselmouth.Sound(chunk, sampling_frequency=sr)
+        pitch = call(sound, "To Pitch (cc)", 0.0, 75.0, 4, False, 0.03, 0.45, 0.01, 0.35, 0.14, 600.0)
+        point_process = call([sound, pitch], "To PointProcess (cc)")
 
-        f0_clean = np.array([])
-    
-    # Classical Micro-Acoustic Metrics (Jitter & Shimmer)
-    jitter = np.std(np.diff(f0_clean)) / np.mean(f0_clean) if (len(f0_clean) > 1 and np.mean(f0_clean) > 0) else 0.0
-    
-    rms = librosa.feature.rms(y=chunk, hop_length=1024)
-    shimmer = np.std(rms) / np.mean(rms) if np.mean(rms) > 0 else 0.0
-    
-    # Harmonic-to-Noise Ratio (HNR) Logic
-    try:
-        harmonic = librosa.effects.harmonic(chunk, margin=2.0)
-        energy_diff = np.sum((chunk - harmonic)**2)
-        hnr = 10 * np.log10(np.sum(harmonic**2) / max(1e-6, energy_diff)) if energy_diff > 0 else 0.0
+        local_jitter = call(point_process, "Get jitter (local)", 0.0, 0.0, 0.0001, 0.02, 1.3)
+        local_shimmer = call([sound, point_process], "Get shimmer (local)", 0, 0.0001, 0.02, 1.3, 1.6, 55)
+        hnr = call(sound, "To Harmonicity (cc)", 0.01, 75.0, 0.1, 1.0)
+        mean_hnr = call(hnr, "Get mean", 0.0, 0.0)
+
+        local_jitter = 0.0 if np.isnan(local_jitter) else local_jitter
+        local_shimmer = 0.0 if np.isnan(local_shimmer) else local_shimmer
+        mean_hnr = 0.0 if np.isnan(mean_hnr) or mean_hnr < -100 else mean_hnr
     except Exception:
-        hnr = 0.0
-    
-    # Extract 13 Mel-Frequency Cepstral Coefficients (MFCCs)
-    mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13, hop_length=1024)
+        local_jitter = 0.0
+        local_shimmer = 0.0
+        mean_hnr = 0.0
+
+    # Peak normalization before MFCC (matching notebook)
+    peak = np.max(np.abs(chunk)) if len(chunk) > 0 else 0.0
+    if peak > 0.0:
+        chunk_normalized = chunk / peak
+    else:
+        chunk_normalized = chunk
+
+    # Extract 13 MFCCs with hop_length=512 (matching notebook)
+    mfccs = librosa.feature.mfcc(y=chunk_normalized, sr=sr, n_mfcc=13, hop_length=512)
     mfcc_means = np.mean(mfccs, axis=1)
-    
-    # Concatenate and normalize structural arrays against math edge cases
-    features = np.array([jitter, shimmer, hnr] + list(mfcc_means))
+
+    # Concatenate features
+    features = np.array([local_jitter, local_shimmer, mean_hnr] + list(mfcc_means))
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
     return features
 
@@ -105,7 +133,7 @@ def _resolve_positive_probability(model, probabilities):
 
 
 def predict_from_audio_bytes(file_bytes: bytes):
-    if MODEL is None:
+    if MODEL is None and DEEP_MODEL is None:
         raise RuntimeError("Prediction engine is offline.")
 
     y = None
@@ -140,8 +168,9 @@ def predict_from_audio_bytes(file_bytes: bytes):
 
     chunk_samples = int(3.0 * sr)
 
+    # VAD with top_db=20 (matching notebook)
     try:
-        intervals = librosa.effects.split(y, top_db=25)
+        intervals = librosa.effects.split(y, top_db=20)
         if len(intervals) > 0:
             v_signal = np.concatenate([y[start:end] for start, end in intervals])
             if len(v_signal) < chunk_samples:
@@ -151,11 +180,24 @@ def predict_from_audio_bytes(file_bytes: bytes):
     except Exception:
         v_signal = y
 
+    # Peak normalization after VAD (matching notebook timing)
+    peak = float(np.max(np.abs(v_signal))) if len(v_signal) > 0 else 0.0
+    if peak > 0.0:
+        v_signal = v_signal / peak
+
     if len(v_signal) < chunk_samples:
         v_signal = np.pad(v_signal, (0, chunk_samples - len(v_signal)), mode='constant')
 
+    # Route to appropriate model type
+    if MODEL_TYPE == "deep":
+        return _predict_deep_learning(v_signal, sr, chunk_samples)
+    else:
+        return _predict_classical(v_signal, sr, chunk_samples)
+
+def _predict_classical(v_signal: np.ndarray, sr: int, chunk_samples: int):
+    """Classical ML prediction path using handcrafted features"""
     chunks_features = []
-    step_size = chunk_samples
+    step_size = max(1, chunk_samples // 2)
 
     for start_idx in range(0, len(v_signal) - chunk_samples + 1, step_size):
         chunk = v_signal[start_idx:start_idx + chunk_samples]
@@ -168,9 +210,6 @@ def predict_from_audio_bytes(file_bytes: bytes):
         except Exception:
             continue
 
-        if len(chunks_features) >= 2:
-            break
-
     if not chunks_features:
         fallback_chunk = v_signal[:chunk_samples]
         if len(fallback_chunk) < chunk_samples:
@@ -178,6 +217,11 @@ def predict_from_audio_bytes(file_bytes: bytes):
         chunks_features.append(extract_single_chunk_features(fallback_chunk, sr))
 
     X_extracted = np.array(chunks_features)
+    if X_extracted.ndim == 1:
+        X_extracted = X_extracted.reshape(1, -1)
+    elif X_extracted.shape[0] > 1:
+        X_extracted = np.mean(X_extracted, axis=0, keepdims=True)
+
     if X_extracted.shape[1] != EXPECTED_FEATURES:
         raise ValueError(f"Feature shape tracking mismatch. Expected {EXPECTED_FEATURES}, processed {X_extracted.shape[1]}.")
 
@@ -188,24 +232,81 @@ def predict_from_audio_bytes(file_bytes: bytes):
     chunk_probabilities = MODEL.predict_proba(X_scaled)
     positive_probabilities = _resolve_positive_probability(MODEL, chunk_probabilities)
     mean_positive_prob = float(np.mean(positive_probabilities))
+    max_positive_prob = float(np.max(positive_probabilities))
+    decision_probability = max_positive_prob if max_positive_prob >= mean_positive_prob else mean_positive_prob
 
-    final_prediction = 1 if mean_positive_prob >= PREDICTION_THRESHOLD else 0
-    final_confidence = mean_positive_prob if final_prediction == 1 else (1.0 - mean_positive_prob)
+    final_prediction = 1 if decision_probability >= PREDICTION_THRESHOLD else 0
+    final_confidence = decision_probability if final_prediction == 1 else (1.0 - decision_probability)
 
     return {
         "prediction": final_prediction,
         "diagnosis": "Parkinson's Disease Detected" if final_prediction == 1 else "Healthy Control",
         "confidence_score": round(float(final_confidence), 4),
         "total_chunks_analyzed": len(chunks_features),
-        "positive_class_probability": round(mean_positive_prob, 4),
+        "positive_class_probability": round(decision_probability, 4),
         "positive_class_label": int(POSITIVE_CLASS_LABEL),
+        "model_type": "classical"
+    }
+
+def _predict_deep_learning(v_signal: np.ndarray, sr: int, chunk_samples: int):
+    """Deep learning prediction path using spectrogram features"""
+    chunks_spectrograms = []
+    step_size = max(1, chunk_samples // 2)
+
+    for start_idx in range(0, len(v_signal) - chunk_samples + 1, step_size):
+        chunk = v_signal[start_idx:start_idx + chunk_samples]
+        if len(chunk) < chunk_samples:
+            continue
+
+        try:
+            spec = extract_log_mel_tensor(chunk, sr)
+            chunks_spectrograms.append(spec)
+        except Exception:
+            continue
+
+    if not chunks_spectrograms:
+        fallback_chunk = v_signal[:chunk_samples]
+        if len(fallback_chunk) < chunk_samples:
+            fallback_chunk = np.pad(fallback_chunk, (0, chunk_samples - len(fallback_chunk)), mode='constant')
+        chunks_spectrograms.append(extract_log_mel_tensor(fallback_chunk, sr))
+
+    X_extracted = np.array(chunks_spectrograms)
+    
+    # Normalize to [0, 1] range (matching notebook preprocessing)
+    t_min, t_max = X_extracted.min(), X_extracted.max()
+    denom = (t_max - t_min + 1e-7)
+    X_normalized = np.clip((X_extracted - t_min) / denom, 0.0, 1.0)
+    
+    # Convert to RGB if needed for MobileNetV2
+    if X_normalized.shape[-1] == 1:
+        X_rgb = np.repeat(X_normalized, 3, axis=-1)
+    else:
+        X_rgb = X_normalized
+
+    # Get predictions
+    chunk_probabilities = DEEP_MODEL.predict(X_rgb, verbose=0).ravel()
+    mean_positive_prob = float(np.mean(chunk_probabilities))
+    max_positive_prob = float(np.max(chunk_probabilities))
+    decision_probability = max_positive_prob if max_positive_prob >= mean_positive_prob else mean_positive_prob
+
+    final_prediction = 1 if decision_probability >= PREDICTION_THRESHOLD else 0
+    final_confidence = decision_probability if final_prediction == 1 else (1.0 - decision_probability)
+
+    return {
+        "prediction": final_prediction,
+        "diagnosis": "Parkinson's Disease Detected" if final_prediction == 1 else "Healthy Control",
+        "confidence_score": round(float(final_confidence), 4),
+        "total_chunks_analyzed": len(chunks_spectrograms),
+        "positive_class_probability": round(decision_probability, 4),
+        "positive_class_label": int(POSITIVE_CLASS_LABEL),
+        "model_type": "deep_learning"
     }
 
 
 @app.get("/")
 def health_check():
     """Simple status route verification utility"""
-    return {"status": "online", "model_integrity": MODEL is not None}
+    return {"status": "online", "model_integrity": MODEL is not None or DEEP_MODEL is not None, "model_type": MODEL_TYPE}
 
 
 @app.post("/predict")
