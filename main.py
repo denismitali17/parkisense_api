@@ -31,41 +31,58 @@ MODEL = None
 SCALER = None
 IQR_BOUNDS = None
 DEEP_MODEL = None
+NORM_BOUNDS = None
 MODEL_TYPE = "classical"  # "classical" or "deep"
 EXPECTED_FEATURES = 16
 POSITIVE_CLASS_LABEL = int(os.getenv("PARKINSONS_POSITIVE_CLASS", "1"))
 PREDICTION_THRESHOLD = float(os.getenv("PARKINSONS_THRESHOLD", "0.5"))
+
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "production_parkinsons_model.joblib"
-SCALER_PATH = BASE_DIR / "production_scaler.joblib"
-IQR_BOUNDS_PATH = BASE_DIR / "production_iqr_bounds.joblib"
-DEEP_MODEL_PATH = BASE_DIR / "ml_track" / "output" / "production_deep_learning_model.keras"
+
+# Updated production path targets matching your 4 winning deployment assets
+MODEL_PATH = BASE_DIR / "best_classical_svm_model.joblib"
+SCALER_PATH = BASE_DIR / "classical_features_scaler.joblib"
+IQR_BOUNDS_PATH = BASE_DIR / "production_iqr_bounds.joblib"  # Optional fallback if kept
+DEEP_MODEL_PATH = BASE_DIR / "best_deep_learning_crnn_model.keras"
+NORM_BOUNDS_PATH = BASE_DIR / "deep_learning_normalization_bounds.joblib"
 
 @app.on_event("startup")
 def load_assets():  
     """Initializes and loads pre-trained machine learning artifacts upon server startup"""
-    global MODEL, SCALER, IQR_BOUNDS, EXPECTED_FEATURES, DEEP_MODEL, MODEL_TYPE
+    global MODEL, SCALER, IQR_BOUNDS, EXPECTED_FEATURES, DEEP_MODEL, MODEL_TYPE, NORM_BOUNDS
     try:
-        # Try loading deep learning model first
+        # Load deep learning model and scaling parameters
         if DEEP_MODEL_PATH.exists():
             DEEP_MODEL = tf.keras.models.load_model(DEEP_MODEL_PATH, compile=False)
             MODEL_TYPE = "deep"
-            print(f"[SUCCESS] Deep learning model loaded from {DEEP_MODEL_PATH}")
+            print(f"[SUCCESS] Leaderboard-winning CRNN model loaded from {DEEP_MODEL_PATH}")
+            
+            if NORM_BOUNDS_PATH.exists():
+                NORM_BOUNDS = joblib.load(NORM_BOUNDS_PATH)
+                print(f"[SUCCESS] Deep learning normalization bounds loaded.")
         else:
-            # Fall back to classical model
+            print(f"[WARN] Deep learning model file not found at {DEEP_MODEL_PATH}. Checking classical fallbacks...")
+
+        # Load classical model pipeline components
+        if MODEL_PATH.exists():
             MODEL = joblib.load(MODEL_PATH)
-            SCALER = joblib.load(SCALER_PATH)
-            IQR_BOUNDS = joblib.load(IQR_BOUNDS_PATH)
+            if SCALER_PATH.exists():
+                SCALER = joblib.load(SCALER_PATH)
+            if IQR_BOUNDS_PATH.exists():
+                IQR_BOUNDS = joblib.load(IQR_BOUNDS_PATH)
 
             if hasattr(MODEL, "n_features_in_"):
                 EXPECTED_FEATURES = MODEL.n_features_in_
-            MODEL_TYPE = "classical"
-            print(f"[SUCCESS] Classical model assets loaded successfully. Expected features: {EXPECTED_FEATURES}")
+            
+            if DEEP_MODEL is None:
+                MODEL_TYPE = "classical"
+            print(f"[SUCCESS] Classical SVM model assets loaded successfully. Expected features: {EXPECTED_FEATURES}")
+            
     except Exception as e:
         print(f"[FATAL] System failed to initialize machine learning assets: {str(e)}")
 
 def extract_log_mel_tensor(chunk: np.ndarray, sr: int, n_mels: int = 128, target_shape: tuple = (128, 128)) -> np.ndarray:
-    """Maps continuous time-domain signals to 2D structural logarithmic frequency scale representations (matching notebook)"""
+    """Maps continuous time-domain signals to 2D structural logarithmic frequency scale representations"""
     peak = np.max(np.abs(chunk)) if len(chunk) > 0 else 0.0
     if peak > 0.0:
         chunk = chunk / peak
@@ -102,18 +119,15 @@ def extract_single_chunk_features(chunk: np.ndarray, sr: int) -> np.ndarray:
         local_shimmer = 0.0
         mean_hnr = 0.0
 
-    # Peak normalization before MFCC (matching notebook)
     peak = np.max(np.abs(chunk)) if len(chunk) > 0 else 0.0
     if peak > 0.0:
         chunk_normalized = chunk / peak
     else:
         chunk_normalized = chunk
 
-    # Extract 13 MFCCs with hop_length=512 (matching notebook)
     mfccs = librosa.feature.mfcc(y=chunk_normalized, sr=sr, n_mfcc=13, hop_length=512)
     mfcc_means = np.mean(mfccs, axis=1)
 
-    # Concatenate features
     features = np.array([local_jitter, local_shimmer, mean_hnr] + list(mfcc_means))
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
     return features
@@ -130,7 +144,6 @@ def _resolve_positive_probability(model, probabilities):
         return probabilities[:, positive_index]
 
     return probabilities[:, 1] if probabilities.shape[1] > 1 else probabilities[:, 0]
-
 
 def predict_from_audio_bytes(file_bytes: bytes):
     if MODEL is None and DEEP_MODEL is None:
@@ -168,7 +181,6 @@ def predict_from_audio_bytes(file_bytes: bytes):
 
     chunk_samples = int(3.0 * sr)
 
-    # VAD with top_db=20 (matching notebook)
     try:
         intervals = librosa.effects.split(y, top_db=20)
         if len(intervals) > 0:
@@ -180,7 +192,6 @@ def predict_from_audio_bytes(file_bytes: bytes):
     except Exception:
         v_signal = y
 
-    # Peak normalization after VAD (matching notebook timing)
     peak = float(np.max(np.abs(v_signal))) if len(v_signal) > 0 else 0.0
     if peak > 0.0:
         v_signal = v_signal / peak
@@ -188,7 +199,6 @@ def predict_from_audio_bytes(file_bytes: bytes):
     if len(v_signal) < chunk_samples:
         v_signal = np.pad(v_signal, (0, chunk_samples - len(v_signal)), mode='constant')
 
-    # Route to appropriate model type
     if MODEL_TYPE == "deep":
         return _predict_deep_learning(v_signal, sr, chunk_samples)
     else:
@@ -225,9 +235,12 @@ def _predict_classical(v_signal: np.ndarray, sr: int, chunk_samples: int):
     if X_extracted.shape[1] != EXPECTED_FEATURES:
         raise ValueError(f"Feature shape tracking mismatch. Expected {EXPECTED_FEATURES}, processed {X_extracted.shape[1]}.")
 
-    lo, hi = IQR_BOUNDS
-    X_clipped = np.clip(X_extracted, lo, hi)
-    X_scaled = SCALER.transform(X_clipped)
+    # Gracefully bypass clipping if IQR bounds are omitted for the final SVM pipeline
+    if IQR_BOUNDS is not None:
+        lo, hi = IQR_BOUNDS
+        X_extracted = np.clip(X_extracted, lo, hi)
+        
+    X_scaled = SCALER.transform(X_extracted)
 
     chunk_probabilities = MODEL.predict_proba(X_scaled)
     positive_probabilities = _resolve_positive_probability(MODEL, chunk_probabilities)
@@ -272,19 +285,24 @@ def _predict_deep_learning(v_signal: np.ndarray, sr: int, chunk_samples: int):
 
     X_extracted = np.array(chunks_spectrograms)
     
-    # Normalize to [0, 1] range (matching notebook preprocessing)
-    t_min, t_max = X_extracted.min(), X_extracted.max()
+    if NORM_BOUNDS is not None:
+        t_min, t_max = NORM_BOUNDS["t_min"], NORM_BOUNDS["t_max"]
+    else:
+        t_min, t_max = X_extracted.min(), X_extracted.max()
+        
     denom = (t_max - t_min + 1e-7)
     X_normalized = np.clip((X_extracted - t_min) / denom, 0.0, 1.0)
     
-    # Convert to RGB if needed for MobileNetV2
-    if X_normalized.shape[-1] == 1:
-        X_rgb = np.repeat(X_normalized, 3, axis=-1)
+    expected_channels = DEEP_MODEL.input_shape[-1] if hasattr(DEEP_MODEL, "input_shape") else 1
+    if expected_channels == 3 and X_normalized.shape[-1] == 1:
+        X_input = np.repeat(X_normalized, 3, axis=-1)
+    elif expected_channels == 1 and X_normalized.shape[-1] == 3:
+        X_input = X_normalized[..., :1]
     else:
-        X_rgb = X_normalized
+        X_input = X_normalized
 
-    # Get predictions
-    chunk_probabilities = DEEP_MODEL.predict(X_rgb, verbose=0).ravel()
+    # Get batch predictions safely
+    chunk_probabilities = DEEP_MODEL.predict(X_input, verbose=0).ravel()
     mean_positive_prob = float(np.mean(chunk_probabilities))
     max_positive_prob = float(np.max(chunk_probabilities))
     decision_probability = max_positive_prob if max_positive_prob >= mean_positive_prob else mean_positive_prob
@@ -302,12 +320,10 @@ def _predict_deep_learning(v_signal: np.ndarray, sr: int, chunk_samples: int):
         "model_type": "deep_learning"
     }
 
-
 @app.get("/")
 def health_check():
     """Simple status route verification utility"""
     return {"status": "online", "model_integrity": MODEL is not None or DEEP_MODEL is not None, "model_type": MODEL_TYPE}
-
 
 @app.post("/predict")
 async def predict_parkinsons(file: UploadFile = File(...)):
