@@ -59,11 +59,7 @@ def load_assets():
         print(f"[FATAL] System failed to initialize deep learning engine: {str(e)}", flush=True)
 
 def extract_log_mel_tensor(chunk: np.ndarray, sr: int, n_mels: int = 128, target_shape: tuple = (128, 128)) -> np.ndarray:
-    """Maps continuous time-domain signals to 2D structural logarithmic frequency scale representations"""
-    peak = np.max(np.abs(chunk)) if len(chunk) > 0 else 0.0
-    if peak > 0.0:
-        chunk = chunk / peak
-
+    """Maps continuous time-domain signals to 2D structural logarithmic frequency scale representations."""
     hop_len = int((len(chunk) - 1) / (target_shape[1] - 1)) if len(chunk) > target_shape[1] else 512
     stft_matrix = librosa.feature.melspectrogram(y=chunk, sr=sr, n_mels=n_mels, n_fft=2048, hop_length=hop_len)
     log_spec = librosa.power_to_db(stft_matrix, ref=np.max)
@@ -123,9 +119,6 @@ def predict_from_audio_bytes(file_bytes: bytes):
     except Exception:
         v_signal = y
 
-    peak = float(np.max(np.abs(v_signal))) if len(v_signal) > 0 else 0.0
-    if peak > 0.0:
-        v_signal = v_signal / peak
 
     if len(v_signal) < chunk_samples:
         v_signal = np.pad(v_signal, (0, chunk_samples - len(v_signal)), mode='constant')
@@ -178,10 +171,9 @@ def _predict_deep_learning(v_signal: np.ndarray, sr: int, chunk_samples: int):
     if not chunk_probabilities:
         chunk_probabilities.append(0.5)
 
-    # Compute final metrics
+
     mean_positive_prob = float(np.mean(chunk_probabilities))
-    max_positive_prob = float(np.max(chunk_probabilities))
-    decision_probability = max_positive_prob if max_positive_prob >= mean_positive_prob else mean_positive_prob
+    decision_probability = mean_positive_prob
 
     final_prediction = 1 if decision_probability >= PREDICTION_THRESHOLD else 0
     final_confidence = decision_probability if final_prediction == 1 else (1.0 - decision_probability)
