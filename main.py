@@ -77,7 +77,7 @@ def predict_from_audio_bytes(file_bytes: bytes):
         raise RuntimeError("Prediction engine is offline.")
 
     y = None
-    sr = 16000
+    sr = None
 
     try:
         data, sr = sf.read(io.BytesIO(file_bytes))
@@ -85,6 +85,7 @@ def predict_from_audio_bytes(file_bytes: bytes):
         if len(y.shape) > 1:
             y = y.mean(axis=1)
     except Exception:
+
         y = np.frombuffer(file_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         sr = 16000
         if len(y) == 0:
@@ -94,17 +95,6 @@ def predict_from_audio_bytes(file_bytes: bytes):
     if len(y) > max_samples:
         y = y[:max_samples]
 
-    if sr != 16000:
-        try:
-            if len(y) > 512:
-                y = librosa.resample(y, orig_sr=sr, target_sr=16000)
-            else:
-                xp = np.arange(len(y))
-                x_new = np.linspace(0, len(y) - 1, int(len(y) * 16000 / sr))
-                y = np.interp(x_new, xp, y).astype(np.float32)
-        except Exception:
-            pass
-        sr = 16000
 
     chunk_samples = int(3.0 * sr)
 
