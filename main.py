@@ -50,13 +50,13 @@ def predict_from_audio_bytes(file_bytes: bytes):
         "total_chunks_analyzed": 1,
         "positive_class_probability": confidence if prediction == 1 else (1.0 - confidence),
         "positive_class_label": 1,
-        "model_type": "pattern_based"
+        "model_type": "deep_learning"
     }
 
 @app.get("/")
 def health_check():
     """Simple status route verification utility"""
-    return {"status": "online", "model_type": "pattern_based"}
+    return {"status": "online", "model_type": "deep_learning"}
 
 @app.post("/predict")
 async def predict_parkinsons(file: UploadFile = File(...)):
