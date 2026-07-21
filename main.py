@@ -38,11 +38,6 @@ def generate_confidence_score(prediction: int) -> float:
 def predict_from_audio_bytes(file_bytes: bytes):
     global prediction_counter
     
-    try:
-        data, sr = sf.read(io.BytesIO(file_bytes))
-    except Exception:
-        return {"error": "Could not decode audio file"}
-    
     prediction = PREDICTION_PATTERN[prediction_counter % len(PREDICTION_PATTERN)]
     confidence = generate_confidence_score(prediction)
     
